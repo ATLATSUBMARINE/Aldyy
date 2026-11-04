@@ -1,0 +1,2771 @@
+#nullable disable
+
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.IO.Ports;
+using System.Media;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
+
+namespace Weight_Scale_Monitoring
+{
+    public partial class Form1 : Form
+    {
+        // =========================================================
+        // KONTROL GUI
+        // =========================================================
+
+        private ComboBox cmbPort;
+        private ComboBox cmbBaud;
+
+        private Button btnRefresh;
+        private Button btnConnect;
+        private Button btnDisconnect;
+        private Button btnReset;
+        private Button btnRawData;
+        private Button btnExport;
+
+        private CheckBox chkSimulation;
+
+        private Label lblConnection;
+        private Label lblWeight;
+        private Label lblStable;
+        private Label lblResult;
+        private Label lblActiveId;
+        private Label lblOk;
+        private Label lblNg;
+        private Label lblTotal;
+        private Label lblHeaderDate;
+        private Label lblHeaderTime;
+
+        private NumericUpDown numLower;
+        private NumericUpDown numTarget;
+        private NumericUpDown numUpper;
+
+        private TextBox txtScan;
+        private TextBox txtRaw;
+
+        private DataGridView dgvHistory;
+
+        // =========================================================
+        // SERIAL PORT DAN TIMER
+        // =========================================================
+
+        private SerialPort serialPort;
+
+        private readonly StringBuilder serialBuffer =
+            new StringBuilder();
+
+        private readonly System.Windows.Forms.Timer simulationTimer =
+            new System.Windows.Forms.Timer
+            {
+                Interval = 200
+            };
+
+        private readonly System.Windows.Forms.Timer clockTimer =
+            new System.Windows.Forms.Timer
+            {
+                Interval = 1000
+            };
+
+        private readonly Dictionary<string, DataGridViewRow> rowsById =
+            new Dictionary<string, DataGridViewRow>();
+
+        private readonly Random random =
+            new Random();
+
+        private readonly string automaticCsvPath =
+            Path.Combine(
+                AppDomain.CurrentDomain.BaseDirectory,
+                "inspection_log.csv");
+
+        // =========================================================
+        // STATUS PROGRAM
+        // =========================================================
+
+        private string currentProductId = null;
+
+        private bool readyToRecord = true;
+
+        private int stableCount = 0;
+        private int okCount = 0;
+        private int ngCount = 0;
+
+        private double lastWeight = double.NaN;
+
+        private int simulationTick = 0;
+        private double simulationTarget = 12.40;
+
+        private const double EmptyThreshold = 0.50;
+        private const double StableTolerance = 0.005;
+        private const int StableRequired = 5;
+
+        // =========================================================
+        // WARNA GUI
+        // =========================================================
+
+        private readonly Color primaryColor =
+            Color.FromArgb(184, 0, 55);
+
+        private readonly Color primaryHoverColor =
+            Color.FromArgb(210, 0, 65);
+
+        private readonly Color primaryPressedColor =
+            Color.FromArgb(140, 0, 42);
+
+        private readonly Color weightRedColor =
+            Color.FromArgb(240, 15, 70);
+
+        private readonly Color pageColor =
+            Color.FromArgb(241, 243, 246);
+
+        private readonly Color cardColor =
+            Color.White;
+
+        private readonly Color borderColor =
+            Color.FromArgb(210, 214, 221);
+
+        private readonly Color mainTextColor =
+            Color.FromArgb(42, 44, 50);
+
+        private readonly Color secondaryTextColor =
+            Color.FromArgb(105, 108, 115);
+
+        private readonly Color softBackgroundColor =
+            Color.FromArgb(247, 248, 250);
+
+        private readonly Color okColor =
+            Color.FromArgb(15, 135, 65);
+
+        private readonly Color warningColor =
+            Color.FromArgb(220, 130, 15);
+
+        // =========================================================
+        // CONSTRUCTOR
+        // =========================================================
+
+        public Form1()
+        {
+            InitializeComponent();
+            BuildInterface();
+
+            simulationTimer.Tick += SimulationTimer_Tick;
+            clockTimer.Tick += ClockTimer_Tick;
+
+            RefreshComPorts();
+            ResetDisplayOnly();
+            UpdateHeaderClock();
+
+            clockTimer.Start();
+
+            Shown += Form1_Shown;
+        }
+
+        // =========================================================
+        // FORM EVENT
+        // =========================================================
+
+        private void Form1_Shown(object sender, EventArgs e)
+        {
+            txtScan.Focus();
+        }
+
+        private void Form1_Load(object sender, EventArgs e)
+        {
+        }
+
+        protected override void OnFormClosing(
+            FormClosingEventArgs e)
+        {
+            DisconnectScale();
+
+            simulationTimer.Stop();
+            clockTimer.Stop();
+
+            simulationTimer.Tick -= SimulationTimer_Tick;
+            clockTimer.Tick -= ClockTimer_Tick;
+
+            base.OnFormClosing(e);
+        }
+
+        // =========================================================
+        // JAM DAN TANGGAL
+        // =========================================================
+
+        private void ClockTimer_Tick(
+            object sender,
+            EventArgs e)
+        {
+            UpdateHeaderClock();
+        }
+
+        private void UpdateHeaderClock()
+        {
+            if (lblHeaderDate == null ||
+                lblHeaderTime == null)
+            {
+                return;
+            }
+
+            DateTime currentTime =
+                DateTime.Now;
+
+            CultureInfo culture =
+                new CultureInfo("id-ID");
+
+            lblHeaderDate.Text =
+                currentTime.ToString(
+                    "dddd, dd MMMM yyyy",
+                    culture)
+                .ToUpperInvariant();
+
+            lblHeaderTime.Text =
+                currentTime.ToString(
+                    "HH:mm:ss");
+        }
+
+        // =========================================================
+        // PEMBUAT KONTROL
+        // =========================================================
+
+        private Button CreateButton(
+            string text,
+            Color? backgroundColor = null)
+        {
+            Button button = new Button
+            {
+                Text = text,
+                AutoSize = false,
+                Width = 112,
+                Height = 38,
+                Margin = new Padding(5),
+                BackColor = backgroundColor ?? primaryColor,
+                ForeColor = Color.White,
+                FlatStyle = FlatStyle.Flat,
+                Cursor = Cursors.Hand,
+                Font = new Font(
+                    "Segoe UI",
+                    9F,
+                    FontStyle.Bold),
+                UseVisualStyleBackColor = false
+            };
+
+            button.FlatAppearance.BorderSize = 0;
+
+            button.FlatAppearance.MouseOverBackColor =
+                primaryHoverColor;
+
+            button.FlatAppearance.MouseDownBackColor =
+                primaryPressedColor;
+
+            return button;
+        }
+
+        private TableLayoutPanel CreateTable(
+            int columns,
+            int rows)
+        {
+            return new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = columns,
+                RowCount = rows,
+                Margin = Padding.Empty
+            };
+        }
+
+        private GroupBox CreateGroupBox(string title)
+        {
+            return new GroupBox
+            {
+                Text = title,
+                Dock = DockStyle.Fill,
+                Padding = new Padding(12, 10, 12, 12),
+                Margin = new Padding(6),
+                BackColor = cardColor,
+                ForeColor = primaryColor,
+                Font = new Font(
+                    "Segoe UI",
+                    9.5F,
+                    FontStyle.Bold)
+            };
+        }
+
+        private Label CreateTitleLabel(string text)
+        {
+            return new Label
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                TextAlign = ContentAlignment.BottomLeft,
+                ForeColor = secondaryTextColor,
+                BackColor = cardColor,
+                Font = new Font(
+                    "Segoe UI",
+                    8.5F,
+                    FontStyle.Bold),
+                Margin = new Padding(6, 2, 6, 2)
+            };
+        }
+
+        private NumericUpDown CreateWeightInput(decimal value)
+        {
+            return new NumericUpDown
+            {
+                Anchor =
+                    AnchorStyles.Left |
+                    AnchorStyles.Right,
+                DecimalPlaces = 2,
+                Increment = 0.05M,
+                Minimum = 0M,
+                Maximum = 1000M,
+                Value = value,
+                Font = new Font(
+                    "Segoe UI",
+                    12F,
+                    FontStyle.Bold),
+                ForeColor = primaryColor,
+                BackColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                TextAlign = HorizontalAlignment.Center,
+                Margin = new Padding(6)
+            };
+        }
+
+        private Label CreateSummaryLabel(
+            string text,
+            Color textColor,
+            Color backgroundColor)
+        {
+            return new Label
+            {
+                Text = text,
+                Dock = DockStyle.Fill,
+                AutoSize = false,
+                ForeColor = textColor,
+                BackColor = backgroundColor,
+                Font = new Font(
+                    "Segoe UI",
+                    13F,
+                    FontStyle.Bold),
+                Margin = new Padding(5),
+                Padding = new Padding(3),
+                TextAlign = ContentAlignment.MiddleCenter
+            };
+        }
+
+        // =========================================================
+        // LOGO
+        // =========================================================
+
+        private Control CreateLogoPanel()
+        {
+            Panel logoPanel = new Panel
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                Padding = new Padding(12, 10, 12, 10),
+                Margin = Padding.Empty
+            };
+
+            PictureBox pictureLogo = new PictureBox
+            {
+                Dock = DockStyle.Fill,
+                BackColor = Color.White,
+                SizeMode = PictureBoxSizeMode.Zoom,
+                Margin = Padding.Empty
+            };
+
+            string applicationFolder =
+                AppDomain.CurrentDomain.BaseDirectory;
+
+            string[] possibleLogoNames =
+            {
+                "lg.innotek_logo_png.jpg",
+                "lg.innotek_logo_png.jpeg",
+                "lg.innotek_logo_png.png",
+                "lg.innotek_logo.jpg",
+                "lg.innotek_logo.jpeg",
+                "lg.innotek_logo.png",
+                "lg_innotek_logo.jpg",
+                "lg_innotek_logo.jpeg",
+                "lg_innotek_logo.png",
+                "LG_Innotek_Logo.jpg",
+                "LG_Innotek_Logo.jpeg",
+                "LG_Innotek_Logo.png"
+            };
+
+            string logoPath = null;
+
+            foreach (string logoName in possibleLogoNames)
+            {
+                string candidatePath =
+                    Path.Combine(
+                        applicationFolder,
+                        logoName);
+
+                if (File.Exists(candidatePath))
+                {
+                    logoPath = candidatePath;
+                    break;
+                }
+            }
+
+            if (string.IsNullOrEmpty(logoPath))
+            {
+                try
+                {
+                    string[] files =
+                        Directory.GetFiles(
+                            applicationFolder);
+
+                    foreach (string file in files)
+                    {
+                        string extension =
+                            Path.GetExtension(file)
+                                .ToLowerInvariant();
+
+                        bool supported =
+                            extension == ".jpg" ||
+                            extension == ".jpeg" ||
+                            extension == ".png" ||
+                            extension == ".bmp";
+
+                        if (!supported)
+                        {
+                            continue;
+                        }
+
+                        string fileName =
+                            Path.GetFileNameWithoutExtension(file)
+                                .ToLowerInvariant();
+
+                        if (fileName.Contains("innotek") ||
+                            fileName.Contains("lg"))
+                        {
+                            logoPath = file;
+                            break;
+                        }
+                    }
+                }
+                catch
+                {
+                    logoPath = null;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(logoPath))
+            {
+                try
+                {
+                    using (Image temporaryImage =
+                        Image.FromFile(logoPath))
+                    {
+                        pictureLogo.Image =
+                            new Bitmap(temporaryImage);
+                    }
+                }
+                catch
+                {
+                    pictureLogo.Image = null;
+                }
+            }
+
+            if (pictureLogo.Image != null)
+            {
+                logoPanel.Controls.Add(
+                    pictureLogo);
+            }
+            else
+            {
+                Label fallbackLabel = new Label
+                {
+                    Text = "LG Innotek",
+                    Dock = DockStyle.Fill,
+                    TextAlign =
+                        ContentAlignment.MiddleCenter,
+                    ForeColor = primaryColor,
+                    BackColor = Color.White,
+                    Font = new Font(
+                        "Segoe UI",
+                        15F,
+                        FontStyle.Bold)
+                };
+
+                logoPanel.Controls.Add(
+                    fallbackLabel);
+            }
+
+            return logoPanel;
+        }
+
+        private Control CreateDateTimePanel()
+        {
+            TableLayoutPanel dateTimePanel =
+                new TableLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    ColumnCount = 1,
+                    RowCount = 2,
+                    BackColor = Color.White,
+                    Padding = new Padding(10, 8, 10, 8),
+                    Margin = Padding.Empty
+                };
+
+            dateTimePanel.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    45F));
+
+            dateTimePanel.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    55F));
+
+            lblHeaderDate = new Label
+            {
+                Text = "-",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.BottomCenter,
+                ForeColor = secondaryTextColor,
+                BackColor = Color.White,
+                Font = new Font(
+                    "Segoe UI",
+                    8.5F,
+                    FontStyle.Bold),
+                AutoEllipsis = true,
+                Margin = Padding.Empty
+            };
+
+            lblHeaderTime = new Label
+            {
+                Text = "00:00:00",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.TopCenter,
+                ForeColor = primaryColor,
+                BackColor = Color.White,
+                Font = new Font(
+                    "Consolas",
+                    16F,
+                    FontStyle.Bold),
+                Margin = Padding.Empty
+            };
+
+            dateTimePanel.Controls.Add(
+                lblHeaderDate,
+                0,
+                0);
+
+            dateTimePanel.Controls.Add(
+                lblHeaderTime,
+                0,
+                1);
+
+            return dateTimePanel;
+        }
+
+        // =========================================================
+        // MEMBUAT GUI
+        // =========================================================
+
+        private void BuildInterface()
+        {
+            SuspendLayout();
+
+            Font = new Font("Segoe UI", 9.5F);
+            BackColor = pageColor;
+            ForeColor = mainTextColor;
+
+            WindowState = FormWindowState.Maximized;
+            MinimumSize = new Size(1100, 700);
+
+            Text =
+                "Weight Scale Monitoring System - LG Innotek";
+
+            Panel scrollContainer = new Panel
+            {
+                Dock = DockStyle.Fill,
+                AutoScroll = true,
+                BackColor = pageColor,
+                Padding = Padding.Empty
+            };
+
+            TableLayoutPanel root =
+                new TableLayoutPanel
+                {
+                    Dock = DockStyle.Top,
+                    ColumnCount = 2,
+                    RowCount = 5,
+                    Height = 880,
+                    Padding = new Padding(12),
+                    Margin = Padding.Empty,
+                    BackColor = pageColor,
+                    MinimumSize = new Size(1080, 880)
+                };
+
+            root.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    50F));
+
+            root.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    50F));
+
+            root.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Absolute,
+                    82F));
+
+            root.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Absolute,
+                    90F));
+
+            root.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Absolute,
+                    250F));
+
+            root.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Absolute,
+                    92F));
+
+            root.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Absolute,
+                    340F));
+
+            // =====================================================
+            // HEADER
+            // =====================================================
+
+            TableLayoutPanel header =
+                new TableLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    ColumnCount = 3,
+                    RowCount = 1,
+                    BackColor = primaryColor,
+                    Margin = new Padding(6, 3, 6, 7)
+                };
+
+            // Logo dibuat lebih proporsional
+            header.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Absolute,
+                    245F));
+
+            // Judul menggunakan ruang tersisa
+            header.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    100F));
+
+            // Blok putih tanggal dan jam
+            header.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Absolute,
+                    245F));
+
+            header.Controls.Add(
+                CreateLogoPanel(),
+                0,
+                0);
+
+            Label titleLabel = new Label
+            {
+                Text = "WEIGHT SCALE MONITORING SYSTEM",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.MiddleLeft,
+                ForeColor = Color.White,
+                BackColor = primaryColor,
+                Font = new Font(
+                    "Segoe UI",
+                    18F,
+                    FontStyle.Bold),
+                Padding = new Padding(30, 0, 15, 0),
+                AutoEllipsis = true,
+                Margin = Padding.Empty
+            };
+
+            header.Controls.Add(
+                titleLabel,
+                1,
+                0);
+
+            header.Controls.Add(
+                CreateDateTimePanel(),
+                2,
+                0);
+
+            root.Controls.Add(
+                header,
+                0,
+                0);
+
+            root.SetColumnSpan(
+                header,
+                2);
+
+            // =====================================================
+            // CONNECTION
+            // =====================================================
+
+            GroupBox connectionGroup =
+                CreateGroupBox("CONNECTION");
+
+            FlowLayoutPanel connectionFlow =
+                new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    FlowDirection =
+                        FlowDirection.LeftToRight,
+                    WrapContents = false,
+                    AutoScroll = true,
+                    BackColor = cardColor,
+                    Padding = new Padding(8, 4, 8, 4),
+                    Margin = Padding.Empty
+                };
+
+            Label portTitle = new Label
+            {
+                Text = "COM PORT",
+                AutoSize = true,
+                ForeColor = secondaryTextColor,
+                BackColor = cardColor,
+                Font = new Font(
+                    "Segoe UI",
+                    8.5F,
+                    FontStyle.Bold),
+                Margin = new Padding(5, 14, 4, 3)
+            };
+
+            cmbPort = new ComboBox
+            {
+                Width = 115,
+                DropDownStyle =
+                    ComboBoxStyle.DropDownList,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font(
+                    "Segoe UI",
+                    9.5F,
+                    FontStyle.Bold),
+                BackColor = Color.White,
+                ForeColor = mainTextColor,
+                Margin = new Padding(4, 9, 10, 4)
+            };
+
+            Label baudTitle = new Label
+            {
+                Text = "BAUD RATE",
+                AutoSize = true,
+                ForeColor = secondaryTextColor,
+                BackColor = cardColor,
+                Font = new Font(
+                    "Segoe UI",
+                    8.5F,
+                    FontStyle.Bold),
+                Margin = new Padding(5, 14, 4, 3)
+            };
+
+            cmbBaud = new ComboBox
+            {
+                Width = 105,
+                DropDownStyle =
+                    ComboBoxStyle.DropDownList,
+                FlatStyle = FlatStyle.Flat,
+                Font = new Font(
+                    "Segoe UI",
+                    9.5F,
+                    FontStyle.Bold),
+                BackColor = Color.White,
+                ForeColor = mainTextColor,
+                Margin = new Padding(4, 9, 10, 4)
+            };
+
+            cmbBaud.Items.AddRange(
+                new object[]
+                {
+                    "300",
+                    "600",
+                    "1200",
+                    "2400",
+                    "4800",
+                    "9600",
+                    "19200",
+                    "38400"
+                });
+
+            cmbBaud.SelectedItem = "9600";
+
+            btnRefresh =
+                CreateButton("REFRESH");
+
+            btnConnect =
+                CreateButton("CONNECT");
+
+            btnDisconnect =
+                CreateButton(
+                    "DISCONNECT",
+                    Color.FromArgb(105, 108, 115));
+
+            btnDisconnect.Enabled = false;
+
+            chkSimulation = new CheckBox
+            {
+                Text = "Mode Simulasi",
+                AutoSize = true,
+                ForeColor = mainTextColor,
+                BackColor = cardColor,
+                Font = new Font(
+                    "Segoe UI",
+                    9.5F,
+                    FontStyle.Bold),
+                Margin = new Padding(14, 14, 8, 3)
+            };
+
+            lblConnection = new Label
+            {
+                Text = "● DISCONNECTED",
+                AutoSize = true,
+                ForeColor = primaryColor,
+                BackColor = cardColor,
+                Font = new Font(
+                    "Segoe UI",
+                    9.5F,
+                    FontStyle.Bold),
+                Margin = new Padding(14, 14, 3, 3)
+            };
+
+            btnRefresh.Click += BtnRefresh_Click;
+            btnConnect.Click += BtnConnect_Click;
+            btnDisconnect.Click += BtnDisconnect_Click;
+
+            connectionFlow.Controls.Add(portTitle);
+            connectionFlow.Controls.Add(cmbPort);
+            connectionFlow.Controls.Add(baudTitle);
+            connectionFlow.Controls.Add(cmbBaud);
+            connectionFlow.Controls.Add(btnRefresh);
+            connectionFlow.Controls.Add(btnConnect);
+            connectionFlow.Controls.Add(btnDisconnect);
+            connectionFlow.Controls.Add(chkSimulation);
+            connectionFlow.Controls.Add(lblConnection);
+
+            connectionGroup.Controls.Add(
+                connectionFlow);
+
+            root.Controls.Add(
+                connectionGroup,
+                0,
+                1);
+
+            root.SetColumnSpan(
+                connectionGroup,
+                2);
+
+            // =====================================================
+            // LIVE WEIGHT
+            // =====================================================
+
+            GroupBox weightGroup =
+                CreateGroupBox("LIVE WEIGHT");
+
+            TableLayoutPanel weightTable =
+                CreateTable(1, 3);
+
+            weightTable.Padding =
+                new Padding(5);
+
+            weightTable.BackColor =
+                cardColor;
+
+            weightTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    58F));
+
+            weightTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    14F));
+
+            weightTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    28F));
+
+            lblWeight = new Label
+            {
+                Text = "0.00 kg",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.MiddleCenter,
+                BackColor =
+                    Color.FromArgb(22, 23, 27),
+                ForeColor = weightRedColor,
+
+                // Ukuran awal diperkecil agar tidak terlalu penuh
+                Font = new Font(
+                    "Consolas",
+                    34F,
+                    FontStyle.Bold),
+
+                Margin = new Padding(2),
+                AutoEllipsis = true
+            };
+
+            // Menyesuaikan ukuran font berat secara otomatis
+            lblWeight.Resize +=
+                delegate
+                {
+                    float fontSize =
+                        Math.Min(
+                            36F,
+                            Math.Max(
+                                24F,
+                                lblWeight.Height * 0.38F));
+
+                    if (Math.Abs(
+                        lblWeight.Font.Size -
+                        fontSize) > 0.5F)
+                    {
+                        Font oldFont =
+                            lblWeight.Font;
+
+                        lblWeight.Font =
+                            new Font(
+                                "Consolas",
+                                fontSize,
+                                FontStyle.Bold);
+
+                        oldFont.Dispose();
+                    }
+                };
+
+            lblStable = new Label
+            {
+                Text = "KOSONG",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.MiddleCenter,
+                BackColor = softBackgroundColor,
+                ForeColor = secondaryTextColor,
+                Font = new Font(
+                    "Segoe UI",
+                    10.5F,
+                    FontStyle.Bold),
+                Margin = new Padding(2)
+            };
+
+            lblResult = new Label
+            {
+                Text = "WAITING",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.MiddleCenter,
+                BackColor =
+                    Color.FromArgb(230, 231, 234),
+                ForeColor = mainTextColor,
+                Font = new Font(
+                    "Segoe UI",
+                    23F,
+                    FontStyle.Bold),
+                Margin = new Padding(2)
+            };
+
+            weightTable.Controls.Add(
+                lblWeight,
+                0,
+                0);
+
+            weightTable.Controls.Add(
+                lblStable,
+                0,
+                1);
+
+            weightTable.Controls.Add(
+                lblResult,
+                0,
+                2);
+
+            weightGroup.Controls.Add(
+                weightTable);
+
+            root.Controls.Add(
+                weightGroup,
+                0,
+                2);
+
+            // =====================================================
+            // PANEL KANAN
+            // =====================================================
+
+            TableLayoutPanel rightTable =
+                CreateTable(1, 2);
+
+            rightTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    48F));
+
+            rightTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    52F));
+
+            // =====================================================
+            // SCAN PRODUCT ID
+            // =====================================================
+
+            GroupBox scanGroup =
+                CreateGroupBox("SCAN PRODUCT ID");
+
+            TableLayoutPanel scanTable =
+                CreateTable(2, 2);
+
+            scanTable.Padding =
+                new Padding(6);
+
+            scanTable.BackColor =
+                cardColor;
+
+            scanTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    48F));
+
+            scanTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    52F));
+
+            scanTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    65F));
+
+            scanTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    35F));
+
+            txtScan = new TextBox
+            {
+                Anchor =
+                    AnchorStyles.Left |
+                    AnchorStyles.Right,
+                Font = new Font(
+                    "Segoe UI",
+                    14F,
+                    FontStyle.Bold),
+                BackColor = Color.White,
+                ForeColor = mainTextColor,
+                BorderStyle =
+                    BorderStyle.FixedSingle,
+                Margin = new Padding(5, 7, 10, 5)
+            };
+
+            txtScan.KeyDown += TxtScan_KeyDown;
+
+            lblActiveId = new Label
+            {
+                Text = "ID aktif: -",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.MiddleLeft,
+                ForeColor = primaryColor,
+                BackColor = cardColor,
+                Font = new Font(
+                    "Segoe UI",
+                    11F,
+                    FontStyle.Bold),
+                AutoEllipsis = true,
+                Padding = new Padding(8, 0, 0, 0)
+            };
+
+            Label scanHint = new Label
+            {
+                Text =
+                    "Scan barcode, tekan Enter, lalu letakkan produk di timbangan.",
+                Dock = DockStyle.Fill,
+                TextAlign =
+                    ContentAlignment.MiddleLeft,
+                ForeColor = secondaryTextColor,
+                BackColor = cardColor,
+                Font = new Font(
+                    "Segoe UI",
+                    9F),
+                AutoEllipsis = true,
+                Padding = new Padding(5, 0, 0, 0)
+            };
+
+            scanTable.Controls.Add(
+                txtScan,
+                0,
+                0);
+
+            scanTable.Controls.Add(
+                lblActiveId,
+                1,
+                0);
+
+            scanTable.Controls.Add(
+                scanHint,
+                0,
+                1);
+
+            scanTable.SetColumnSpan(
+                scanHint,
+                2);
+
+            scanGroup.Controls.Add(
+                scanTable);
+
+            // =====================================================
+            // INSPECTION LIMITS
+            // =====================================================
+
+            GroupBox limitGroup =
+                CreateGroupBox(
+                    "INSPECTION LIMITS (kg)");
+
+            TableLayoutPanel limitTable =
+                CreateTable(3, 2);
+
+            limitTable.Padding =
+                new Padding(7);
+
+            limitTable.BackColor =
+                cardColor;
+
+            limitTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    33.33F));
+
+            limitTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    33.33F));
+
+            limitTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    33.34F));
+
+            limitTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Absolute,
+                    27F));
+
+            limitTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    100F));
+
+            numLower =
+                CreateWeightInput(12.00M);
+
+            numTarget =
+                CreateWeightInput(12.40M);
+
+            numUpper =
+                CreateWeightInput(12.80M);
+
+            limitTable.Controls.Add(
+                CreateTitleLabel("LOWER"),
+                0,
+                0);
+
+            limitTable.Controls.Add(
+                CreateTitleLabel("TARGET"),
+                1,
+                0);
+
+            limitTable.Controls.Add(
+                CreateTitleLabel("UPPER"),
+                2,
+                0);
+
+            limitTable.Controls.Add(
+                numLower,
+                0,
+                1);
+
+            limitTable.Controls.Add(
+                numTarget,
+                1,
+                1);
+
+            limitTable.Controls.Add(
+                numUpper,
+                2,
+                1);
+
+            limitGroup.Controls.Add(
+                limitTable);
+
+            rightTable.Controls.Add(
+                scanGroup,
+                0,
+                0);
+
+            rightTable.Controls.Add(
+                limitGroup,
+                0,
+                1);
+
+            root.Controls.Add(
+                rightTable,
+                1,
+                2);
+
+            // =====================================================
+            // RAW DATA TERSEMBUNYI
+            // =====================================================
+
+            txtRaw = new TextBox
+            {
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Font = new Font(
+                    "Consolas",
+                    10F),
+                BackColor =
+                    Color.FromArgb(24, 25, 29),
+                ForeColor =
+                    Color.FromArgb(235, 235, 235)
+            };
+
+            // =====================================================
+            // PRODUCTION SUMMARY
+            // =====================================================
+
+            GroupBox summaryGroup =
+                CreateGroupBox(
+                    "PRODUCTION SUMMARY");
+
+            TableLayoutPanel summaryTable =
+                CreateTable(6, 1);
+
+            summaryTable.Padding =
+                new Padding(5);
+
+            summaryTable.BackColor =
+                cardColor;
+
+            summaryTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    19F));
+
+            summaryTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    19F));
+
+            summaryTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    19F));
+
+            summaryTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    14F));
+
+            summaryTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    14F));
+
+            summaryTable.ColumnStyles.Add(
+                new ColumnStyle(
+                    SizeType.Percent,
+                    15F));
+
+            lblOk = CreateSummaryLabel(
+                "OK: 0",
+                okColor,
+                Color.FromArgb(232, 247, 238));
+
+            lblNg = CreateSummaryLabel(
+                "NG: 0",
+                primaryColor,
+                Color.FromArgb(252, 235, 240));
+
+            lblTotal = CreateSummaryLabel(
+                "TOTAL: 0",
+                mainTextColor,
+                Color.FromArgb(239, 240, 243));
+
+            btnReset = CreateButton(
+                "RESET",
+                Color.FromArgb(105, 108, 115));
+
+            btnReset.Anchor =
+                AnchorStyles.None;
+
+            btnReset.Click += BtnReset_Click;
+
+            btnRawData = CreateButton(
+                "RAW DATA",
+                Color.FromArgb(70, 72, 78));
+
+            btnRawData.Anchor =
+                AnchorStyles.None;
+
+            btnRawData.Click += BtnRawData_Click;
+
+            btnExport = CreateButton(
+                "EXPORT CSV",
+                primaryColor);
+
+            btnExport.Anchor =
+                AnchorStyles.None;
+
+            btnExport.Click += BtnExport_Click;
+
+            summaryTable.Controls.Add(lblOk, 0, 0);
+            summaryTable.Controls.Add(lblNg, 1, 0);
+            summaryTable.Controls.Add(lblTotal, 2, 0);
+            summaryTable.Controls.Add(btnReset, 3, 0);
+            summaryTable.Controls.Add(btnRawData, 4, 0);
+            summaryTable.Controls.Add(btnExport, 5, 0);
+
+            summaryGroup.Controls.Add(
+                summaryTable);
+
+            root.Controls.Add(
+                summaryGroup,
+                0,
+                3);
+
+            root.SetColumnSpan(
+                summaryGroup,
+                2);
+
+            // =====================================================
+            // HISTORY
+            // =====================================================
+
+            GroupBox historyGroup =
+                CreateGroupBox(
+                    "STATUS BERAT PER ID PRODUK");
+
+            TableLayoutPanel historyTable =
+                CreateTable(1, 1);
+
+            historyTable.Padding =
+                new Padding(5);
+
+            historyTable.BackColor =
+                cardColor;
+
+            historyTable.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    100F));
+
+            dgvHistory = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                AllowUserToAddRows = false,
+                AllowUserToDeleteRows = false,
+                AllowUserToResizeRows = false,
+                RowHeadersVisible = false,
+                BackgroundColor = Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+                GridColor = borderColor,
+
+                AutoSizeColumnsMode =
+                    DataGridViewAutoSizeColumnsMode.Fill,
+
+                SelectionMode =
+                    DataGridViewSelectionMode.FullRowSelect,
+
+                MultiSelect = false,
+                EnableHeadersVisualStyles = false,
+
+                ColumnHeadersHeight = 40,
+
+                ColumnHeadersHeightSizeMode =
+                    DataGridViewColumnHeadersHeightSizeMode
+                        .DisableResizing,
+
+                AutoSizeRowsMode =
+                    DataGridViewAutoSizeRowsMode.None,
+
+                ScrollBars = ScrollBars.Both
+            };
+
+            dgvHistory.RowTemplate.Height = 35;
+
+            dgvHistory
+                .ColumnHeadersDefaultCellStyle
+                .BackColor = primaryColor;
+
+            dgvHistory
+                .ColumnHeadersDefaultCellStyle
+                .ForeColor = Color.White;
+
+            dgvHistory
+                .ColumnHeadersDefaultCellStyle
+                .Font = new Font(
+                    "Segoe UI",
+                    9.5F,
+                    FontStyle.Bold);
+
+            dgvHistory
+                .ColumnHeadersDefaultCellStyle
+                .SelectionBackColor = primaryColor;
+
+            dgvHistory
+                .ColumnHeadersDefaultCellStyle
+                .SelectionForeColor = Color.White;
+
+            dgvHistory.DefaultCellStyle.Font =
+                new Font(
+                    "Segoe UI",
+                    9.5F);
+
+            dgvHistory.DefaultCellStyle.ForeColor =
+                mainTextColor;
+
+            dgvHistory.DefaultCellStyle.BackColor =
+                Color.White;
+
+            dgvHistory.DefaultCellStyle.Padding =
+                new Padding(5, 2, 5, 2);
+
+            dgvHistory.DefaultCellStyle.SelectionBackColor =
+                Color.FromArgb(246, 220, 228);
+
+            dgvHistory.DefaultCellStyle.SelectionForeColor =
+                mainTextColor;
+
+            dgvHistory
+                .AlternatingRowsDefaultCellStyle
+                .BackColor = softBackgroundColor;
+
+            dgvHistory.Columns.Add(
+                "time",
+                "Waktu");
+
+            dgvHistory.Columns.Add(
+                "id",
+                "Product ID");
+
+            dgvHistory.Columns.Add(
+                "weight",
+                "Berat (kg)");
+
+            dgvHistory.Columns.Add(
+                "result",
+                "Hasil");
+
+            dgvHistory.Columns.Add(
+                "count",
+                "Jumlah Cek");
+
+            dgvHistory.Columns["time"].FillWeight = 110F;
+            dgvHistory.Columns["id"].FillWeight = 230F;
+            dgvHistory.Columns["weight"].FillWeight = 70F;
+            dgvHistory.Columns["result"].FillWeight = 60F;
+            dgvHistory.Columns["count"].FillWeight = 65F;
+
+            dgvHistory.Columns["weight"]
+                .DefaultCellStyle.Alignment =
+                DataGridViewContentAlignment.MiddleCenter;
+
+            dgvHistory.Columns["result"]
+                .DefaultCellStyle.Alignment =
+                DataGridViewContentAlignment.MiddleCenter;
+
+            dgvHistory.Columns["count"]
+                .DefaultCellStyle.Alignment =
+                DataGridViewContentAlignment.MiddleCenter;
+
+            historyTable.Controls.Add(
+                dgvHistory,
+                0,
+                0);
+
+            historyGroup.Controls.Add(
+                historyTable);
+
+            root.Controls.Add(
+                historyGroup,
+                0,
+                4);
+
+            root.SetColumnSpan(
+                historyGroup,
+                2);
+
+            // =====================================================
+            // SCROLL CONTAINER
+            // =====================================================
+
+            scrollContainer.Controls.Add(root);
+
+            Controls.Clear();
+            Controls.Add(scrollContainer);
+
+            Action resizeLayout =
+                delegate
+                {
+                    int availableWidth =
+                        scrollContainer.ClientSize.Width;
+
+                    if (scrollContainer
+                        .VerticalScroll
+                        .Visible)
+                    {
+                        availableWidth -=
+                            SystemInformation
+                                .VerticalScrollBarWidth;
+                    }
+
+                    root.Width =
+                        Math.Max(
+                            1080,
+                            availableWidth);
+                };
+
+            scrollContainer.Resize +=
+                delegate
+                {
+                    resizeLayout();
+                };
+
+            resizeLayout();
+
+            ResumeLayout(true);
+        }
+
+        // =========================================================
+        // RESET TAMPILAN
+        // =========================================================
+
+        private void ResetDisplayOnly()
+        {
+            currentProductId = null;
+            readyToRecord = true;
+            stableCount = 0;
+            lastWeight = double.NaN;
+
+            lblWeight.Text = "0.00 kg";
+
+            lblStable.Text = "KOSONG";
+            lblStable.ForeColor =
+                secondaryTextColor;
+
+            lblActiveId.Text =
+                "ID aktif: -";
+
+            SetResult(
+                "WAITING",
+                Color.FromArgb(230, 231, 234),
+                mainTextColor);
+        }
+
+        // =========================================================
+        // COM PORT
+        // =========================================================
+
+        private void BtnRefresh_Click(
+            object sender,
+            EventArgs e)
+        {
+            RefreshComPorts();
+            txtScan.Focus();
+        }
+
+        private void RefreshComPorts()
+        {
+            string previousPort = null;
+
+            if (cmbPort != null &&
+                cmbPort.SelectedItem != null)
+            {
+                previousPort =
+                    cmbPort.SelectedItem.ToString();
+            }
+
+            cmbPort.Items.Clear();
+
+            string[] ports =
+                SerialPort.GetPortNames();
+
+            Array.Sort(ports);
+
+            cmbPort.Items.AddRange(ports);
+
+            if (!string.IsNullOrWhiteSpace(previousPort) &&
+                cmbPort.Items.Contains(previousPort))
+            {
+                cmbPort.SelectedItem =
+                    previousPort;
+            }
+            else if (cmbPort.Items.Count > 0)
+            {
+                cmbPort.SelectedIndex = 0;
+            }
+        }
+
+        // =========================================================
+        // CONNECTION
+        // =========================================================
+
+        private void BtnConnect_Click(
+            object sender,
+            EventArgs e)
+        {
+            if (chkSimulation.Checked)
+            {
+                StartSimulation();
+                SetConnectedControls(true);
+                txtScan.Focus();
+
+                return;
+            }
+
+            if (cmbPort.SelectedItem == null)
+            {
+                MessageBox.Show(
+                    "Pilih COM port terlebih dahulu.",
+                    "COM Port",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                return;
+            }
+
+            if (cmbBaud.SelectedItem == null)
+            {
+                MessageBox.Show(
+                    "Pilih baud rate terlebih dahulu.",
+                    "Baud Rate",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                return;
+            }
+
+            try
+            {
+                serialPort = new SerialPort
+                {
+                    PortName =
+                        cmbPort.SelectedItem.ToString(),
+
+                    BaudRate =
+                        int.Parse(
+                            cmbBaud.SelectedItem.ToString()),
+
+                    Parity = Parity.None,
+                    DataBits = 8,
+                    StopBits = StopBits.One,
+                    Handshake = Handshake.None,
+                    Encoding = Encoding.ASCII,
+                    ReadTimeout = 1000,
+                    WriteTimeout = 1000
+                };
+
+                serialPort.DataReceived +=
+                    SerialPort_DataReceived;
+
+                serialPort.Open();
+
+                SetConnectionStatus(
+                    "● CONNECTED " +
+                    serialPort.PortName,
+                    okColor);
+
+                SetConnectedControls(true);
+
+                txtScan.Focus();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    "Gagal terhubung ke timbangan.\r\n\r\n" +
+                    ex.Message,
+                    "Connection Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+
+                DisconnectScale();
+            }
+        }
+
+        private void BtnDisconnect_Click(
+            object sender,
+            EventArgs e)
+        {
+            DisconnectScale();
+            txtScan.Focus();
+        }
+
+        private void StartSimulation()
+        {
+            simulationTick = 0;
+
+            simulationTarget =
+                (double)numTarget.Value;
+
+            readyToRecord = true;
+            stableCount = 0;
+            lastWeight = double.NaN;
+
+            simulationTimer.Start();
+
+            SetConnectionStatus(
+                "● SIMULASI",
+                warningColor);
+        }
+
+        private void DisconnectScale()
+        {
+            simulationTimer.Stop();
+
+            try
+            {
+                if (serialPort != null)
+                {
+                    serialPort.DataReceived -=
+                        SerialPort_DataReceived;
+
+                    if (serialPort.IsOpen)
+                    {
+                        serialPort.Close();
+                    }
+
+                    serialPort.Dispose();
+                    serialPort = null;
+                }
+            }
+            catch
+            {
+            }
+
+            if (lblConnection != null)
+            {
+                SetConnectionStatus(
+                    "● DISCONNECTED",
+                    primaryColor);
+            }
+
+            SetConnectedControls(false);
+        }
+
+        private void SetConnectedControls(bool connected)
+        {
+            if (btnConnect == null)
+            {
+                return;
+            }
+
+            btnConnect.Enabled = !connected;
+            btnDisconnect.Enabled = connected;
+            btnRefresh.Enabled = !connected;
+
+            cmbPort.Enabled = !connected;
+            cmbBaud.Enabled = !connected;
+            chkSimulation.Enabled = !connected;
+        }
+
+        private void SetConnectionStatus(
+            string text,
+            Color color)
+        {
+            lblConnection.Text = text;
+            lblConnection.ForeColor = color;
+        }
+
+        // =========================================================
+        // SERIAL DATA
+        // =========================================================
+
+        private void SerialPort_DataReceived(
+            object sender,
+            SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                if (serialPort == null ||
+                    !serialPort.IsOpen)
+                {
+                    return;
+                }
+
+                string data =
+                    serialPort.ReadExisting();
+
+                if (string.IsNullOrEmpty(data))
+                {
+                    return;
+                }
+
+                BeginInvoke(
+                    new Action(
+                        delegate
+                        {
+                            ReceiveScaleData(data);
+                        }));
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    BeginInvoke(
+                        new Action(
+                            delegate
+                            {
+                                SetConnectionStatus(
+                                    "● SERIAL ERROR",
+                                    primaryColor);
+
+                                txtRaw.AppendText(
+                                    "Serial error: " +
+                                    ex.Message +
+                                    Environment.NewLine);
+                            }));
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void ReceiveScaleData(string data)
+        {
+            string visibleData = data
+                .Replace("\r", "\\r")
+                .Replace("\n", "\\n\r\n");
+
+            txtRaw.AppendText(visibleData);
+
+            if (txtRaw.TextLength > 5000)
+            {
+                txtRaw.Text =
+                    txtRaw.Text.Substring(
+                        txtRaw.TextLength - 2500);
+
+                txtRaw.SelectionStart =
+                    txtRaw.TextLength;
+
+                txtRaw.ScrollToCaret();
+            }
+
+            serialBuffer.Append(data);
+
+            string fullData =
+                serialBuffer.ToString();
+
+            int separatorIndex;
+
+            while ((separatorIndex =
+                fullData.IndexOfAny(
+                    new char[] { '\r', '\n' })) >= 0)
+            {
+                string line =
+                    fullData.Substring(
+                        0,
+                        separatorIndex).Trim();
+
+                fullData =
+                    fullData.Substring(
+                        separatorIndex + 1);
+
+                if (!string.IsNullOrWhiteSpace(line))
+                {
+                    ParseScaleLine(line);
+                }
+            }
+
+            serialBuffer.Clear();
+            serialBuffer.Append(fullData);
+
+            if (serialBuffer.Length > 500)
+            {
+                serialBuffer.Clear();
+            }
+        }
+
+        // =========================================================
+        // PARSING DATA TIMBANGAN
+        // =========================================================
+
+        private void ParseScaleLine(string line)
+        {
+            Match numberMatch =
+                Regex.Match(
+                    line,
+                    @"[-+]?\d+(?:[.,]\d+)?");
+
+            if (!numberMatch.Success)
+            {
+                lblStable.Text =
+                    "DATA TIDAK VALID";
+
+                lblStable.ForeColor =
+                    primaryColor;
+
+                return;
+            }
+
+            string weightText =
+                numberMatch.Value.Replace(',', '.');
+
+            double weight;
+
+            bool parsed =
+                double.TryParse(
+                    weightText,
+                    NumberStyles.Float,
+                    CultureInfo.InvariantCulture,
+                    out weight);
+
+            if (!parsed)
+            {
+                lblStable.Text =
+                    "DATA TIDAK VALID";
+
+                lblStable.ForeColor =
+                    primaryColor;
+
+                return;
+            }
+
+            string upperLine =
+                line.ToUpperInvariant();
+
+            bool containsKg =
+                upperLine.Contains("KG");
+
+            bool containsGram =
+                Regex.IsMatch(
+                    upperLine,
+                    @"\d(?:[.,]\d+)?\s*G\b");
+
+            if (!containsKg && containsGram)
+            {
+                weight /= 1000.0;
+            }
+
+            if (weight < 0)
+            {
+                weight = 0;
+            }
+
+            ProcessWeight(weight);
+        }
+
+        // =========================================================
+        // PROSES BERAT
+        // =========================================================
+
+        private void ProcessWeight(double weight)
+        {
+            lblWeight.Text =
+                weight.ToString(
+                    "0.00",
+                    CultureInfo.InvariantCulture) +
+                " kg";
+
+            if (weight < EmptyThreshold)
+            {
+                readyToRecord = true;
+                stableCount = 0;
+                lastWeight = double.NaN;
+
+                lblStable.Text = "KOSONG";
+                lblStable.ForeColor =
+                    secondaryTextColor;
+
+                if (currentProductId == null)
+                {
+                    SetResult(
+                        "WAITING",
+                        Color.FromArgb(230, 231, 234),
+                        mainTextColor);
+                }
+                else
+                {
+                    SetResult(
+                        "TARUH PRODUK",
+                        Color.FromArgb(246, 220, 228),
+                        primaryColor);
+                }
+
+                return;
+            }
+
+            if (!double.IsNaN(lastWeight) &&
+                Math.Abs(weight - lastWeight) <=
+                StableTolerance)
+            {
+                stableCount++;
+            }
+            else
+            {
+                stableCount = 0;
+            }
+
+            lastWeight = weight;
+
+            bool isStable =
+                stableCount >= StableRequired;
+
+            lblStable.Text =
+                isStable
+                    ? "STABLE"
+                    : "UNSTABLE";
+
+            lblStable.ForeColor =
+                isStable
+                    ? okColor
+                    : warningColor;
+
+            if (!isStable ||
+                !readyToRecord)
+            {
+                return;
+            }
+
+            if (currentProductId == null)
+            {
+                SetResult(
+                    "SCAN ID DULU",
+                    Color.FromArgb(255, 235, 185),
+                    Color.FromArgb(110, 70, 0));
+
+                return;
+            }
+
+            readyToRecord = false;
+
+            RecordInspection(
+                currentProductId,
+                weight);
+        }
+
+        private void SetResult(
+            string text,
+            Color background,
+            Color foreground)
+        {
+            lblResult.Text = text;
+            lblResult.BackColor = background;
+            lblResult.ForeColor = foreground;
+        }
+
+        // =========================================================
+        // BARCODE
+        // =========================================================
+
+        private void TxtScan_KeyDown(
+            object sender,
+            KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter)
+            {
+                return;
+            }
+
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+
+            string scannedId =
+                txtScan.Text.Trim();
+
+            txtScan.Clear();
+
+            if (string.IsNullOrWhiteSpace(scannedId))
+            {
+                return;
+            }
+
+            currentProductId = scannedId;
+
+            lblActiveId.Text =
+                "ID aktif: " +
+                scannedId;
+
+            stableCount = 0;
+            lastWeight = double.NaN;
+
+            SetResult(
+                "TARUH PRODUK",
+                Color.FromArgb(246, 220, 228),
+                primaryColor);
+        }
+
+        // =========================================================
+        // SIMPAN HASIL INSPEKSI
+        // =========================================================
+
+        private void RecordInspection(
+            string productId,
+            double weight)
+        {
+            if (numLower.Value >= numUpper.Value)
+            {
+                MessageBox.Show(
+                    "Lower limit harus lebih kecil dari Upper limit.",
+                    "Limit Tidak Valid",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Warning);
+
+                readyToRecord = true;
+                txtScan.Focus();
+
+                return;
+            }
+
+            decimal decimalWeight =
+                Convert.ToDecimal(weight);
+
+            bool isOk =
+                decimalWeight >= numLower.Value &&
+                decimalWeight <= numUpper.Value;
+
+            string result =
+                isOk ? "OK" : "NG";
+
+            if (isOk)
+            {
+                okCount++;
+
+                SetResult(
+                    "OK",
+                    Color.FromArgb(27, 155, 80),
+                    Color.White);
+            }
+            else
+            {
+                ngCount++;
+
+                SetResult(
+                    "NG",
+                    primaryColor,
+                    Color.White);
+
+                SystemSounds.Hand.Play();
+            }
+
+            lblOk.Text =
+                "OK: " + okCount;
+
+            lblNg.Text =
+                "NG: " + ngCount;
+
+            lblTotal.Text =
+                "TOTAL: " +
+                (okCount + ngCount);
+
+            string inspectionTime =
+                DateTime.Now.ToString(
+                    "yyyy-MM-dd HH:mm:ss");
+
+            string weightText =
+                weight.ToString(
+                    "0.00",
+                    CultureInfo.InvariantCulture);
+
+            DataGridViewRow existingRow;
+
+            if (rowsById.TryGetValue(
+                productId,
+                out existingRow))
+            {
+                int inspectionCount = 0;
+
+                object previousCount =
+                    existingRow
+                        .Cells["count"]
+                        .Value;
+
+                if (previousCount != null)
+                {
+                    int.TryParse(
+                        previousCount.ToString(),
+                        out inspectionCount);
+                }
+
+                inspectionCount++;
+
+                existingRow.SetValues(
+                    inspectionTime,
+                    productId,
+                    weightText,
+                    result,
+                    inspectionCount);
+
+                existingRow.DefaultCellStyle.BackColor =
+                    isOk
+                        ? Color.FromArgb(232, 247, 238)
+                        : Color.FromArgb(252, 235, 240);
+
+                if (existingRow.Index > 0)
+                {
+                    dgvHistory.Rows.Remove(existingRow);
+                    dgvHistory.Rows.Insert(0, existingRow);
+                }
+
+                rowsById[productId] =
+                    existingRow;
+
+                dgvHistory.ClearSelection();
+
+                existingRow.Selected = true;
+            }
+            else
+            {
+                dgvHistory.Rows.Insert(
+                    0,
+                    inspectionTime,
+                    productId,
+                    weightText,
+                    result,
+                    1);
+
+                DataGridViewRow newRow =
+                    dgvHistory.Rows[0];
+
+                newRow.DefaultCellStyle.BackColor =
+                    isOk
+                        ? Color.FromArgb(232, 247, 238)
+                        : Color.FromArgb(252, 235, 240);
+
+                rowsById[productId] =
+                    newRow;
+
+                dgvHistory.ClearSelection();
+
+                newRow.Selected = true;
+            }
+
+            SaveAutomaticCsv(
+                inspectionTime,
+                productId,
+                weightText,
+                result);
+
+            currentProductId = null;
+
+            lblActiveId.Text =
+                "ID aktif: -";
+
+            txtScan.Clear();
+            txtScan.Focus();
+        }
+
+        // =========================================================
+        // CSV OTOMATIS
+        // =========================================================
+
+        private void SaveAutomaticCsv(
+            string inspectionTime,
+            string productId,
+            string weight,
+            string result)
+        {
+            try
+            {
+                bool newFile =
+                    !File.Exists(automaticCsvPath);
+
+                using (StreamWriter writer =
+                    new StreamWriter(
+                        automaticCsvPath,
+                        true,
+                        new UTF8Encoding(true)))
+                {
+                    if (newFile)
+                    {
+                        writer.WriteLine(
+                            "Time,ProductID,Weight_kg,Result,Source");
+                    }
+
+                    string source =
+                        simulationTimer.Enabled
+                            ? "SIMULATION"
+                            : "SCALE";
+
+                    writer.WriteLine(
+                        CsvValue(inspectionTime) + "," +
+                        CsvValue(productId) + "," +
+                        CsvValue(weight) + "," +
+                        CsvValue(result) + "," +
+                        CsvValue(source));
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    "Gagal menyimpan CSV otomatis.\r\n\r\n" +
+                    ex.Message,
+                    "CSV Error",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
+            }
+        }
+
+        // =========================================================
+        // RAW DATA WINDOW
+        // =========================================================
+
+        private void BtnRawData_Click(
+            object sender,
+            EventArgs e)
+        {
+            Form rawDataForm = new Form
+            {
+                Text = "Raw Data / Troubleshooting",
+                StartPosition =
+                    FormStartPosition.CenterParent,
+                Size = new Size(850, 500),
+                MinimumSize = new Size(650, 400),
+                BackColor = pageColor,
+                ShowIcon = false
+            };
+
+            TextBox rawDataViewer = new TextBox
+            {
+                Dock = DockStyle.Fill,
+                Multiline = true,
+                ReadOnly = true,
+                ScrollBars = ScrollBars.Both,
+                WordWrap = false,
+                Font = new Font(
+                    "Consolas",
+                    10F),
+                BackColor =
+                    Color.FromArgb(24, 25, 29),
+                ForeColor =
+                    Color.FromArgb(235, 235, 235),
+                Text = txtRaw.Text,
+                BorderStyle =
+                    BorderStyle.FixedSingle
+            };
+
+            Button clearButton =
+                CreateButton(
+                    "CLEAR",
+                    Color.FromArgb(105, 108, 115));
+
+            clearButton.Click +=
+                delegate
+                {
+                    txtRaw.Clear();
+                    rawDataViewer.Clear();
+                };
+
+            Button closeButton =
+                CreateButton(
+                    "CLOSE",
+                    primaryColor);
+
+            closeButton.Click +=
+                delegate
+                {
+                    rawDataForm.Close();
+                };
+
+            TableLayoutPanel rawLayout =
+                CreateTable(1, 2);
+
+            rawLayout.Padding =
+                new Padding(12);
+
+            rawLayout.BackColor =
+                pageColor;
+
+            rawLayout.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Percent,
+                    100F));
+
+            rawLayout.RowStyles.Add(
+                new RowStyle(
+                    SizeType.Absolute,
+                    55F));
+
+            FlowLayoutPanel buttonPanel =
+                new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Fill,
+                    FlowDirection =
+                        FlowDirection.RightToLeft,
+                    Padding =
+                        new Padding(0, 5, 0, 0),
+                    BackColor = pageColor
+                };
+
+            buttonPanel.Controls.Add(closeButton);
+            buttonPanel.Controls.Add(clearButton);
+
+            rawLayout.Controls.Add(
+                rawDataViewer,
+                0,
+                0);
+
+            rawLayout.Controls.Add(
+                buttonPanel,
+                0,
+                1);
+
+            rawDataForm.Controls.Add(rawLayout);
+
+            rawDataForm.ShowDialog(this);
+        }
+
+        // =========================================================
+        // SIMULASI
+        // =========================================================
+
+        private void SimulationTimer_Tick(
+            object sender,
+            EventArgs e)
+        {
+            simulationTick++;
+
+            int phase =
+                simulationTick % 80;
+
+            double weight;
+
+            if (phase < 10)
+            {
+                weight =
+                    random.NextDouble() *
+                    0.03;
+            }
+            else if (phase < 25)
+            {
+                double progress =
+                    (phase - 10) /
+                    15.0;
+
+                weight =
+                    simulationTarget *
+                    progress;
+
+                weight +=
+                    (random.NextDouble() - 0.5) *
+                    0.10;
+            }
+            else if (phase < 55)
+            {
+                weight =
+                    simulationTarget;
+            }
+            else if (phase < 65)
+            {
+                double progress =
+                    (phase - 55) /
+                    10.0;
+
+                weight =
+                    simulationTarget *
+                    (1.0 - progress);
+
+                weight +=
+                    (random.NextDouble() - 0.5) *
+                    0.05;
+            }
+            else
+            {
+                weight =
+                    random.NextDouble() *
+                    0.03;
+            }
+
+            if (weight < 0)
+            {
+                weight = 0;
+            }
+
+            ProcessWeight(weight);
+
+            if (phase == 79)
+            {
+                CreateNextSimulationWeight();
+            }
+        }
+
+        private void CreateNextSimulationWeight()
+        {
+            double lower =
+                (double)numLower.Value;
+
+            double target =
+                (double)numTarget.Value;
+
+            double upper =
+                (double)numUpper.Value;
+
+            if (lower >= upper)
+            {
+                simulationTarget = target;
+                return;
+            }
+
+            int resultType =
+                random.Next(0, 10);
+
+            if (resultType < 7)
+            {
+                simulationTarget =
+                    lower +
+                    random.NextDouble() *
+                    (upper - lower);
+            }
+            else if (resultType < 9)
+            {
+                simulationTarget =
+                    Math.Max(
+                        0,
+                        lower -
+                        0.10 -
+                        random.NextDouble() *
+                        0.30);
+            }
+            else
+            {
+                simulationTarget =
+                    upper +
+                    0.10 +
+                    random.NextDouble() *
+                    0.30;
+            }
+
+            simulationTarget =
+                Math.Round(
+                    simulationTarget,
+                    2);
+        }
+
+        // =========================================================
+        // RESET
+        // =========================================================
+
+        private void BtnReset_Click(
+            object sender,
+            EventArgs e)
+        {
+            DialogResult answer =
+                MessageBox.Show(
+                    "Reset seluruh counter dan history pemeriksaan?",
+                    "Konfirmasi Reset",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question);
+
+            if (answer != DialogResult.Yes)
+            {
+                txtScan.Focus();
+                return;
+            }
+
+            okCount = 0;
+            ngCount = 0;
+
+            currentProductId = null;
+            readyToRecord = true;
+
+            stableCount = 0;
+            lastWeight = double.NaN;
+            simulationTick = 0;
+
+            lblOk.Text = "OK: 0";
+            lblNg.Text = "NG: 0";
+            lblTotal.Text = "TOTAL: 0";
+
+            lblWeight.Text = "0.00 kg";
+
+            lblStable.Text = "KOSONG";
+            lblStable.ForeColor =
+                secondaryTextColor;
+
+            lblActiveId.Text =
+                "ID aktif: -";
+
+            SetResult(
+                "WAITING",
+                Color.FromArgb(230, 231, 234),
+                mainTextColor);
+
+            dgvHistory.Rows.Clear();
+            rowsById.Clear();
+
+            txtRaw.Clear();
+            txtScan.Clear();
+
+            serialBuffer.Clear();
+
+            txtScan.Focus();
+        }
+
+        // =========================================================
+        // EXPORT CSV
+        // =========================================================
+
+        private void BtnExport_Click(
+            object sender,
+            EventArgs e)
+        {
+            if (dgvHistory.Rows.Count == 0)
+            {
+                MessageBox.Show(
+                    "Belum ada data yang dapat diekspor.",
+                    "Export CSV",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+
+                txtScan.Focus();
+
+                return;
+            }
+
+            using (SaveFileDialog dialog =
+                new SaveFileDialog())
+            {
+                dialog.Title =
+                    "Export Data Pemeriksaan";
+
+                dialog.Filter =
+                    "CSV File (*.csv)|*.csv";
+
+                dialog.DefaultExt =
+                    "csv";
+
+                dialog.AddExtension =
+                    true;
+
+                dialog.FileName =
+                    "Weight_Checker_" +
+                    DateTime.Now.ToString(
+                        "yyyyMMdd_HHmmss") +
+                    ".csv";
+
+                if (dialog.ShowDialog() !=
+                    DialogResult.OK)
+                {
+                    txtScan.Focus();
+                    return;
+                }
+
+                try
+                {
+                    using (StreamWriter writer =
+                        new StreamWriter(
+                            dialog.FileName,
+                            false,
+                            new UTF8Encoding(true)))
+                    {
+                        writer.WriteLine(
+                            "Waktu,Product ID,Berat (kg),Hasil,Jumlah Cek");
+
+                        foreach (
+                            DataGridViewRow row
+                            in dgvHistory.Rows)
+                        {
+                            if (row.IsNewRow)
+                            {
+                                continue;
+                            }
+
+                            string time =
+                                CsvValue(
+                                    row.Cells["time"].Value);
+
+                            string id =
+                                CsvValue(
+                                    row.Cells["id"].Value);
+
+                            string weight =
+                                CsvValue(
+                                    row.Cells["weight"].Value);
+
+                            string result =
+                                CsvValue(
+                                    row.Cells["result"].Value);
+
+                            string count =
+                                CsvValue(
+                                    row.Cells["count"].Value);
+
+                            writer.WriteLine(
+                                time + "," +
+                                id + "," +
+                                weight + "," +
+                                result + "," +
+                                count);
+                        }
+                    }
+
+                    MessageBox.Show(
+                        "Data berhasil diekspor ke:\r\n\r\n" +
+                        dialog.FileName,
+                        "Export Berhasil",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Information);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show(
+                        "Gagal export CSV.\r\n\r\n" +
+                        ex.Message,
+                        "Export Error",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
+            }
+
+            txtScan.Focus();
+        }
+
+        // =========================================================
+        // FORMAT CSV
+        // =========================================================
+
+        private string CsvValue(object value)
+        {
+            string text =
+                value == null
+                    ? string.Empty
+                    : value.ToString();
+
+            if (text.Contains(",") ||
+                text.Contains("\"") ||
+                text.Contains("\r") ||
+                text.Contains("\n"))
+            {
+                text =
+                    "\"" +
+                    text.Replace(
+                        "\"",
+                        "\"\"") +
+                    "\"";
+            }
+
+            return text;
+        }
+    }
+}
