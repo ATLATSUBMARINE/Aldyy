@@ -1,0 +1,494 @@
+#nullable disable
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Globalization;
+using System.IO;
+using System.IO.Ports;
+using System.Linq;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Windows.Forms;
+
+namespace WinFormsApp1
+{
+    public partial class Form1 : Form
+    {
+        // ===== Kontrol =====
+        ComboBox cmbPort, cmbBaud;
+        Button btnRefresh, btnConnect, btnDisconnect, btnReset, btnExport;
+        CheckBox chkSim;
+        Label lblStatus, lblWeight, lblStable, lblResult, lblId, lblOk, lblNg, lblTotal;
+        NumericUpDown numLower, numTarget, numUpper;
+        TextBox txtScan, txtRaw;
+        DataGridView dgv;
+
+        // ===== Logika =====
+        SerialPort sp;
+        readonly StringBuilder buffer = new StringBuilder();
+        readonly System.Windows.Forms.Timer simTimer = new System.Windows.Forms.Timer { Interval = 200 };
+        readonly Dictionary<string, DataGridViewRow> rowsById = new Dictionary<string, DataGridViewRow>();
+        readonly string csvPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "inspection_log.csv");
+
+        string currentId = null;
+        bool armed = true;
+        int stableCount = 0;
+        double lastWeight = double.NaN;
+        int okCount = 0, ngCount = 0;
+        int simTick = 0;
+        double simTarget = 12.4;
+        readonly Random rnd = new Random();
+        const double EmptyThreshold = 0.5;
+        const int StableNeeded = 5;
+
+        public Form1()
+        {
+            InitializeComponent();
+            BuildUi();
+            simTimer.Tick += SimTick;
+            RefreshPorts();
+            txtScan.Focus();
+        }
+
+        // ================= UI =================
+        void FitFont(Label l, string fam, float maxChars, bool bold)
+        {
+            if (l.Width < 20 || l.Height < 20) return;
+            float byH = l.Height * 0.55f * 0.75f;
+            float byW = l.Width / (maxChars * 0.65f) * 0.75f;
+            float sz = Math.Max(8f, Math.Min(byH, byW));
+            if (Math.Abs(l.Font.Size - sz) < 0.5f) return;
+            Font old = l.Font;
+            l.Font = new Font(fam, sz, bold ? FontStyle.Bold : FontStyle.Regular);
+            old.Dispose();
+        }
+
+        TableLayoutPanel TLP(int cols, int rows)
+        {
+            return new TableLayoutPanel
+            {
+                Dock = DockStyle.Fill,
+                ColumnCount = cols,
+                RowCount = rows,
+                Margin = Padding.Empty
+            };
+        }
+
+        Button Btn(string text)
+        {
+            return new Button
+            {
+                Text = text,
+                AutoSize = true,
+                AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Padding = new Padding(6, 2, 6, 2)
+            };
+        }
+
+        void BuildUi()
+        {
+            this.Font = new Font("Segoe UI", 10f);
+            this.MinimumSize = new Size(900, 620);
+            this.WindowState = FormWindowState.Maximized;
+
+            var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 4, Padding = new Padding(8) };
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            root.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            root.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 40));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 15));
+            root.RowStyles.Add(new RowStyle(SizeType.Percent, 45));
+
+            // ---------- Connection ----------
+            var gbConn = new GroupBox { Text = "Connection", Dock = DockStyle.Fill, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink };
+            var flow = new FlowLayoutPanel { Dock = DockStyle.Fill, AutoSize = true, WrapContents = true };
+            cmbPort = new ComboBox { Width = 100, DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbBaud = new ComboBox { Width = 90, DropDownStyle = ComboBoxStyle.DropDownList };
+            cmbBaud.Items.AddRange(new object[] { "1200", "2400", "4800", "9600", "19200", "38400", "57600", "115200" });
+            cmbBaud.SelectedItem = "9600";
+            btnRefresh = Btn("Refresh");
+            btnConnect = Btn("Connect");
+            btnDisconnect = Btn("Disconnect");
+            btnDisconnect.Enabled = false;
+            chkSim = new CheckBox { Text = "Mode Simulasi", AutoSize = true, Margin = new Padding(10, 6, 10, 3) };
+            lblStatus = new Label { Text = "● DISCONNECTED", AutoSize = true, ForeColor = Color.Red, Font = new Font("Segoe UI", 10, FontStyle.Bold), Margin = new Padding(10, 6, 3, 3) };
+            btnRefresh.Click += (s, e) => RefreshPorts();
+            btnConnect.Click += BtnConnect_Click;
+            btnDisconnect.Click += (s, e) => Disconnect();
+            flow.Controls.AddRange(new Control[] { cmbPort, cmbBaud, btnRefresh, btnConnect, btnDisconnect, chkSim, lblStatus });
+            gbConn.Controls.Add(flow);
+            root.Controls.Add(gbConn, 0, 0);
+            root.SetColumnSpan(gbConn, 2);
+
+            // ---------- Live Weight ----------
+            var gbW = new GroupBox { Text = "Live Weight", Dock = DockStyle.Fill };
+            var tw = TLP(1, 3);
+            tw.RowStyles.Add(new RowStyle(SizeType.Percent, 55));
+            tw.RowStyles.Add(new RowStyle(SizeType.Percent, 12));
+            tw.RowStyles.Add(new RowStyle(SizeType.Percent, 33));
+            lblWeight = new Label { Text = "0.00 kg", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, BackColor = Color.Black, ForeColor = Color.Lime, Font = new Font("Consolas", 30, FontStyle.Bold) };
+            lblStable = new Label { Text = "UNSTABLE", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, Font = new Font("Segoe UI", 11, FontStyle.Bold) };
+            lblResult = new Label { Text = "WAITING", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleCenter, BackColor = Color.Gainsboro, Font = new Font("Segoe UI", 20, FontStyle.Bold) };
+            lblWeight.Resize += (s, e) => FitFont(lblWeight, "Consolas", 9, true);
+            lblResult.Resize += (s, e) => FitFont(lblResult, "Segoe UI", 13, true);
+            tw.Controls.Add(lblWeight, 0, 0);
+            tw.Controls.Add(lblStable, 0, 1);
+            tw.Controls.Add(lblResult, 0, 2);
+            gbW.Controls.Add(tw);
+            root.Controls.Add(gbW, 0, 1);
+
+            // ---------- Kanan atas: Scan + Limits ----------
+            var right = TLP(1, 2);
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+            right.RowStyles.Add(new RowStyle(SizeType.Percent, 50));
+
+            var gbScan = new GroupBox { Text = "Scan Product ID", Dock = DockStyle.Fill };
+            var ts = TLP(2, 2);
+            ts.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            ts.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            ts.RowStyles.Add(new RowStyle(SizeType.Percent, 60));
+            ts.RowStyles.Add(new RowStyle(SizeType.Percent, 40));
+            txtScan = new TextBox { Anchor = AnchorStyles.Left | AnchorStyles.Right, Font = new Font("Segoe UI", 14) };
+            txtScan.KeyDown += TxtScan_KeyDown;
+            lblId = new Label { Text = "ID aktif: -", Dock = DockStyle.Fill, TextAlign = ContentAlignment.MiddleLeft, Font = new Font("Segoe UI", 14, FontStyle.Bold) };
+            var hint = new Label { Text = "Scan barcode (scanner USB = keyboard) lalu letakkan produk di timbangan.", Dock = DockStyle.Fill, ForeColor = Color.DimGray };
+            ts.Controls.Add(txtScan, 0, 0);
+            ts.Controls.Add(lblId, 1, 0);
+            ts.Controls.Add(hint, 0, 1);
+            ts.SetColumnSpan(hint, 2);
+            gbScan.Controls.Add(ts);
+
+            var gbLim = new GroupBox { Text = "Inspection Limits (kg)", Dock = DockStyle.Fill };
+            var tl = TLP(3, 2);
+            for (int i = 0; i < 3; i++) tl.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.33f));
+            tl.RowStyles.Add(new RowStyle(SizeType.Percent, 45));
+            tl.RowStyles.Add(new RowStyle(SizeType.Percent, 55));
+            numLower = new NumericUpDown { Anchor = AnchorStyles.Left | AnchorStyles.Right, DecimalPlaces = 2, Increment = 0.05m, Maximum = 1000, Value = 12.00m };
+            numTarget = new NumericUpDown { Anchor = AnchorStyles.Left | AnchorStyles.Right, DecimalPlaces = 2, Increment = 0.05m, Maximum = 1000, Value = 12.40m };
+            numUpper = new NumericUpDown { Anchor = AnchorStyles.Left | AnchorStyles.Right, DecimalPlaces = 2, Increment = 0.05m, Maximum = 1000, Value = 12.80m };
+            tl.Controls.Add(new Label { Text = "Lower", Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft }, 0, 0);
+            tl.Controls.Add(new Label { Text = "Target", Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft }, 1, 0);
+            tl.Controls.Add(new Label { Text = "Upper", Dock = DockStyle.Fill, TextAlign = ContentAlignment.BottomLeft }, 2, 0);
+            tl.Controls.Add(numLower, 0, 1);
+            tl.Controls.Add(numTarget, 1, 1);
+            tl.Controls.Add(numUpper, 2, 1);
+            gbLim.Controls.Add(tl);
+
+            right.Controls.Add(gbScan, 0, 0);
+            right.Controls.Add(gbLim, 0, 1);
+            root.Controls.Add(right, 1, 1);
+
+            // ---------- Summary ----------
+            var gbSum = new GroupBox { Text = "Production Summary", Dock = DockStyle.Fill, MinimumSize = new Size(0, 80) };
+            var fs = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false };
+            var big = new Font("Segoe UI", 14, FontStyle.Bold);
+            lblOk = new Label { Text = "OK: 0", AutoSize = true, Font = big, ForeColor = Color.Green, Margin = new Padding(8, 6, 16, 3) };
+            lblNg = new Label { Text = "NG: 0", AutoSize = true, Font = big, ForeColor = Color.Red, Margin = new Padding(8, 6, 16, 3) };
+            lblTotal = new Label { Text = "Total: 0", AutoSize = true, Font = big, Margin = new Padding(8, 6, 16, 3) };
+            btnReset = Btn("Reset");
+            btnReset.Margin = new Padding(8, 6, 3, 3);
+            btnReset.Click += BtnReset_Click;
+            fs.Controls.AddRange(new Control[] { lblOk, lblNg, lblTotal, btnReset });
+            gbSum.Controls.Add(fs);
+            root.Controls.Add(gbSum, 0, 2);
+
+            // ---------- Raw data ----------
+            var gbRaw = new GroupBox { Text = "Raw Data (troubleshooting)", Dock = DockStyle.Fill, MinimumSize = new Size(0, 80) };
+            txtRaw = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
+            gbRaw.Controls.Add(txtRaw);
+            root.Controls.Add(gbRaw, 1, 2);
+
+            // ---------- History ----------
+            var gbHist = new GroupBox { Text = "Status Berat per ID Produk", Dock = DockStyle.Fill };
+            var th = TLP(1, 2);
+            th.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            th.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            dgv = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                AllowUserToAddRows = false,
+                RowHeadersVisible = false,
+                BackgroundColor = Color.White,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect
+            };
+            dgv.Columns.Add("time", "Waktu");
+            dgv.Columns.Add("id", "Product ID");
+            dgv.Columns.Add("w", "Berat (kg)");
+            dgv.Columns.Add("res", "Hasil");
+            dgv.Columns.Add("n", "Jumlah Cek");
+            btnExport = Btn("Export CSV");
+            btnExport.Click += BtnExport_Click;
+            th.Controls.Add(dgv, 0, 0);
+            th.Controls.Add(btnExport, 0, 1);
+            gbHist.Controls.Add(th);
+            root.Controls.Add(gbHist, 0, 3);
+            root.SetColumnSpan(gbHist, 2);
+
+            this.Controls.Add(root);
+        }
+
+        // ================= Koneksi =================
+        void RefreshPorts()
+        {
+            cmbPort.Items.Clear();
+            cmbPort.Items.AddRange(SerialPort.GetPortNames());
+            if (cmbPort.Items.Count > 0) cmbPort.SelectedIndex = 0;
+        }
+
+        void BtnConnect_Click(object s, EventArgs e)
+        {
+            if (chkSim.Checked)
+            {
+                simTimer.Start();
+                SetStatus("● SIMULASI (data bukan dari timbangan asli)", Color.DarkOrange);
+            }
+            else
+            {
+                if (cmbPort.SelectedItem == null) { MessageBox.Show("Pilih COM port dulu."); return; }
+                try
+                {
+                    // 8N1 = default umum; SESUAIKAN dengan manual CAS EC-D
+                    sp = new SerialPort(cmbPort.SelectedItem.ToString(), int.Parse(cmbBaud.SelectedItem.ToString()), Parity.None, 8, StopBits.One);
+                    sp.DataReceived += Sp_DataReceived;
+                    sp.Open();
+                    SetStatus("● CONNECTED " + sp.PortName, Color.Green);
+                }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Gagal konek: " + ex.Message);
+                    SetStatus("● ERROR", Color.Red);
+                    return;
+                }
+            }
+            btnConnect.Enabled = false;
+            btnDisconnect.Enabled = true;
+            chkSim.Enabled = false;
+        }
+
+        void Disconnect()
+        {
+            simTimer.Stop();
+            try
+            {
+                if (sp != null)
+                {
+                    sp.DataReceived -= Sp_DataReceived;
+                    if (sp.IsOpen) sp.Close();
+                    sp.Dispose();
+                    sp = null;
+                }
+            }
+            catch { }
+            SetStatus("● DISCONNECTED", Color.Red);
+            btnConnect.Enabled = true;
+            btnDisconnect.Enabled = false;
+            chkSim.Enabled = true;
+        }
+
+        void SetStatus(string t, Color c) { lblStatus.Text = t; lblStatus.ForeColor = c; }
+
+        void Sp_DataReceived(object sender, SerialDataReceivedEventArgs e)
+        {
+            try
+            {
+                string data = sp.ReadExisting();
+                BeginInvoke(new Action(() => OnData(data)));
+            }
+            catch (Exception ex)
+            {
+                try { BeginInvoke(new Action(() => SetStatus("● ERROR: " + ex.Message, Color.Red))); } catch { }
+            }
+        }
+
+        // ================= Parsing =================
+        void OnData(string data)
+        {
+            txtRaw.AppendText(data.Replace("\r", "\\r").Replace("\n", "\\n\r\n"));
+            if (txtRaw.TextLength > 4000) txtRaw.Text = txtRaw.Text.Substring(2000);
+
+            buffer.Append(data);
+            string all = buffer.ToString();
+            int idx;
+            while ((idx = all.IndexOfAny(new[] { '\r', '\n' })) >= 0)
+            {
+                string line = all.Substring(0, idx).Trim();
+                all = all.Substring(idx + 1);
+                if (line.Length > 0) HandleLine(line);
+            }
+            buffer.Clear();
+            buffer.Append(all);
+            if (buffer.Length > 500) buffer.Clear();
+        }
+
+        // PARSER GENERIK: ambil angka pertama. SESUAIKAN dengan format asli EC-D.
+        void HandleLine(string line)
+        {
+            var m = Regex.Match(line, @"[-+]?\d+(\.\d+)?");
+            if (!m.Success)
+            {
+                lblStable.Text = "DATA TIDAK VALID";
+                lblStable.ForeColor = Color.Red;
+                return;
+            }
+            double w = double.Parse(m.Value, CultureInfo.InvariantCulture);
+            string up = line.ToUpperInvariant();
+            if (!up.Contains("KG") && Regex.IsMatch(up, @"\d\s*G\b")) w /= 1000.0;
+            ProcessWeight(w);
+        }
+
+        // ================= Proses berat =================
+        void ProcessWeight(double w)
+        {
+            lblWeight.Text = w.ToString("0.00", CultureInfo.InvariantCulture) + " kg";
+
+            if (w < EmptyThreshold)
+            {
+                armed = true;
+                stableCount = 0;
+                lastWeight = double.NaN;
+                lblStable.Text = "KOSONG";
+                lblStable.ForeColor = Color.Gray;
+                if (currentId == null) SetResult("WAITING", Color.Gainsboro, Color.Black);
+                return;
+            }
+
+            if (!double.IsNaN(lastWeight) && Math.Abs(w - lastWeight) <= 0.005) stableCount++;
+            else stableCount = 0;
+            lastWeight = w;
+
+            bool stable = stableCount >= StableNeeded;
+            lblStable.Text = stable ? "STABLE" : "UNSTABLE";
+            lblStable.ForeColor = stable ? Color.Green : Color.DarkOrange;
+
+            if (stable && armed)
+            {
+                if (currentId == null)
+                {
+                    SetResult("SCAN ID DULU", Color.Khaki, Color.Black);
+                    return;
+                }
+                armed = false;
+                Record(currentId, w);
+            }
+        }
+
+        void Record(string id, double w)
+        {
+            if (numLower.Value >= numUpper.Value)
+            {
+                MessageBox.Show("Lower limit harus lebih kecil dari Upper limit.");
+                armed = true;
+                return;
+            }
+            bool ok = (decimal)w >= numLower.Value && (decimal)w <= numUpper.Value;
+            string res = ok ? "OK" : "NG";
+            if (ok) { okCount++; SetResult("OK", Color.LimeGreen, Color.White); }
+            else { ngCount++; SetResult("NG", Color.Red, Color.White); System.Media.SystemSounds.Hand.Play(); }
+            lblOk.Text = "OK: " + okCount;
+            lblNg.Text = "NG: " + ngCount;
+            lblTotal.Text = "Total: " + (okCount + ngCount);
+
+            string time = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+            string ws = w.ToString("0.00", CultureInfo.InvariantCulture);
+            if (rowsById.TryGetValue(id, out var row))
+            {
+                int n = int.Parse(row.Cells[4].Value.ToString()) + 1;
+                row.SetValues(time, id, ws, res, n);
+                dgv.Rows.Remove(row);
+                dgv.Rows.Insert(0, row);
+            }
+            else
+            {
+                int i = dgv.Rows.Add(time, id, ws, res, 1);
+                var r = dgv.Rows[i];
+                rowsById[id] = r;
+                dgv.Rows.Remove(r);
+                dgv.Rows.Insert(0, r);
+            }
+            rowsById[id].DefaultCellStyle.BackColor = ok ? Color.Honeydew : Color.MistyRose;
+
+            try
+            {
+                bool newFile = !File.Exists(csvPath);
+                using (var sw = new StreamWriter(csvPath, true, Encoding.UTF8))
+                {
+                    if (newFile) sw.WriteLine("Time,ProductID,Weight_kg,Result,Source");
+                    sw.WriteLine($"{time},{id},{ws},{res},{(simTimer.Enabled ? "SIMULATION" : "SCALE")}");
+                }
+            }
+            catch (Exception ex) { MessageBox.Show("Gagal tulis CSV: " + ex.Message); }
+
+            currentId = null;
+            lblId.Text = "ID aktif: -";
+            txtScan.Focus();
+        }
+
+        void SetResult(string t, Color back, Color fore)
+        {
+            lblResult.Text = t;
+            lblResult.BackColor = back;
+            lblResult.ForeColor = fore;
+        }
+
+        // ================= Scanner =================
+        void TxtScan_KeyDown(object s, KeyEventArgs e)
+        {
+            if (e.KeyCode != Keys.Enter) return;
+            e.SuppressKeyPress = true;
+            string id = txtScan.Text.Trim();
+            txtScan.Clear();
+            if (id.Length == 0) return;
+            currentId = id;
+            lblId.Text = "ID aktif: " + id;
+            SetResult("TARUH PRODUK", Color.LightSkyBlue, Color.Black);
+        }
+
+   , 16, 3) };
+            btnReset = Btn("Reset");
+            btnReset.Margin = new Padding(8, 6, 3, 3);
+            btnReset.Click += BtnReset_Click;
+            fs.Controls.AddRange(new Control[] { lblOk, lblNg, lblTotal, btnReset });
+            gbSum.Controls.Add(fs);
+            root.Controls.Add(gbSum, 0, 2);
+
+            // ---------- Raw data ----------
+            var gbRaw = new GroupBox { Text = "Raw Data (troubleshooting)", Dock = DockStyle.Fill, MinimumSize = new Size(0, 80) };
+            txtRaw = new TextBox { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical };
+            gbRaw.Controls.Add(txtRaw);
+            root.Controls.Add(gbRaw, 1, 2);
+
+            // ---------- History ----------
+            var gbHist = new GroupBox { Text = "Status Berat per ID Produk", Dock = DockStyle.Fill };
+            var th = TLP(1, 2);
+            th.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            th.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+            dgv = new DataGridView
+            {
+                Dock = DockStyle.Fill,
+                ReadOnly = true,
+                AllowUserToAddRows = false,
+                RowHeadersVisible = false,
+                BackgroundColor = Color.White,
+                AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill,
+                SelectionMode = DataGridViewSelectionMode.FullRowSelect
+            };
+            dgv.Columns.Add("time", "Waktu");
+            dgv.Columns.Add("id", "Product ID");
+            dgv.Columns.Add("w", "Berat (kg)");
+            dgv.Columns.Add("res", "Hasil");
+            dgv.Columns.Add("n", "Jumlah Cek");
+            btnExport = Btn("Export CSV");
+            btnExport.Click += BtnExport_Click;
+            th.Controls.Add(dgv, 0, 0);
+            th.Controls.Add(btnExport, 0, 1);
+            gbHist.Controls.Add(th);
+            root.Controls.Add(gbHist, 0, 3);
+            root.SetColumnSpan(gbHist, 2);
+
+            this.Controls.Add(root);
+        }
+    }
+}
+
